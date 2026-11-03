@@ -1,0 +1,125 @@
+# PoC build of viogpudo with the #977 cursor fix (eaee2b2), test-signed.
+# Not an upstream workflow: only builds viogpu for Win10 x64 and signs the
+# result with a self-signed test certificate held in repository secrets.
+
+name: viogpudo PoC (test-signed)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      EXPECTED_FIX: eaee2b286fdbac0213811b5b6a3d7e4bc75dd15d
+      INSTALL_DIR: viogpu\Install\Win10\amd64
+      # Driver version 100.200.977.<run>: ranks above any released virtio-win viogpudo
+      VER_RELEASE: "200"
+      VER_MAJOR: "977"
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Verify the built source is eaee2b2
+        run: |
+          git log --oneline -3
+          git merge-base --is-ancestor $env:EXPECTED_FIX HEAD
+          if ($LASTEXITCODE) { throw "$env:EXPECTED_FIX is not an ancestor of HEAD" }
+          # Everything outside .github must be byte-identical to the fix commit
+          git diff --quiet $env:EXPECTED_FIX HEAD -- . ':!.github'
+          if ($LASTEXITCODE) { git diff --stat $env:EXPECTED_FIX HEAD -- . ':!.github'; throw "Source differs from $env:EXPECTED_FIX" }
+          Write-Host "OK: HEAD $(git rev-parse HEAD) contains $env:EXPECTED_FIX with identical driver source"
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Locate WDK tools
+        run: |
+          $kits = 'C:\Program Files (x86)\Windows Kits\10'
+          Get-ChildItem "$kits\Include" -Directory | ForEach-Object {
+            Write-Host "$($_.Name)  km=$(Test-Path "$($_.FullName)\km")"
+          }
+          $inf2cat = Get-ChildItem "$kits\bin" -Recurse -Filter inf2cat.exe | Where-Object FullName -match '\\x86\\' | Sort-Object FullName | Select-Object -Last 1
+          $signtool = Get-ChildItem "$kits\bin" -Recurse -Filter signtool.exe | Where-Object FullName -match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1
+          if (-not $inf2cat -or -not $signtool) { throw "WDK tools not found (inf2cat=$inf2cat signtool=$signtool)" }
+          Write-Host "inf2cat:  $($inf2cat.FullName)"
+          Write-Host "signtool: $($signtool.FullName)"
+          $inf2cat.DirectoryName  | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $signtool.DirectoryName | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build viogpu (Win10 Release x64)
+        run: |
+          msbuild viogpu\viogpu.sln -m -t:Build `
+            "-p:Configuration=Win10 Release" -p:Platform=x64 `
+            -p:_RHEL_RELEASE_VERSION_=$env:VER_RELEASE `
+            -p:_BUILD_MAJOR_VERSION_=$env:VER_MAJOR `
+            -p:_BUILD_MINOR_VERSION_=${{ github.run_number }} `
+            "-flp:LogFile=buildfre_win10_amd64.log;Verbosity=normal"
+          if ($LASTEXITCODE) { throw "msbuild failed" }
+          Get-ChildItem $env:INSTALL_DIR
+          Select-String -Path "$env:INSTALL_DIR\viogpudo.inf" -Pattern '^DriverVer'
+
+      - name: Test-sign driver and catalog
+        env:
+          PFX_B64: ${{ secrets.POC_SIGN_PFX_B64 }}
+          PFX_PASSWORD: ${{ secrets.POC_SIGN_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64) { throw "POC_SIGN_PFX_B64 secret is not set" }
+          $pfx = Join-Path $env:RUNNER_TEMP 'poc.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:PFX_PASSWORD)
+          Write-Host "Signing as: $($cert.Subject)  thumbprint $($cert.Thumbprint)  expires $($cert.NotAfter)"
+          [IO.File]::WriteAllBytes("$env:INSTALL_DIR\ClassroomPocDriver.cer", $cert.Export('Cert'))
+
+          # Sign the .sys first, then rebuild the catalog over it and sign the catalog
+          signtool sign /v /fd SHA256 /f $pfx /p $env:PFX_PASSWORD "$env:INSTALL_DIR\viogpudo.sys"
+          if ($LASTEXITCODE) { throw "signing viogpudo.sys failed" }
+          Remove-Item "$env:INSTALL_DIR\viogpudo.cat" -ErrorAction SilentlyContinue
+          inf2cat /uselocaltime /driver:$env:INSTALL_DIR /os:10_X64,Server10_X64
+          if ($LASTEXITCODE) { throw "inf2cat failed" }
+          signtool sign /v /fd SHA256 /f $pfx /p $env:PFX_PASSWORD "$env:INSTALL_DIR\viogpudo.cat"
+          if ($LASTEXITCODE) { throw "signing viogpudo.cat failed" }
+          Remove-Item $pfx
+
+          # Verify the chain the way the guest will see it: cert trusted as root
+          Import-Certificate -FilePath "$env:INSTALL_DIR\ClassroomPocDriver.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          signtool verify /v /pa "$env:INSTALL_DIR\viogpudo.sys"
+          if ($LASTEXITCODE) { throw "verify viogpudo.sys failed" }
+          signtool verify /v /pa /c "$env:INSTALL_DIR\viogpudo.cat" "$env:INSTALL_DIR\viogpudo.sys"
+          if ($LASTEXITCODE) { throw "verify catalog membership failed" }
+
+      - name: Write build info
+        run: |
+          @(
+            "commit:   $(git rev-parse HEAD)"
+            "contains: $env:EXPECTED_FIX ($(git log -1 --format=%s $env:EXPECTED_FIX))"
+            "run:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            (Select-String -Path "$env:INSTALL_DIR\viogpudo.inf" -Pattern '^DriverVer').Line
+          ) | Tee-Object -FilePath "$env:INSTALL_DIR\BUILD-INFO.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viogpudo-win10-x64-testsigned
+          path: |
+            viogpu/Install/Win10/amd64/viogpudo.sys
+            viogpu/Install/Win10/amd64/viogpudo.inf
+            viogpu/Install/Win10/amd64/viogpudo.cat
+            viogpu/Install/Win10/amd64/viogpudo.pdb
+            viogpu/Install/Win10/amd64/ClassroomPocDriver.cer
+            viogpu/Install/Win10/amd64/BUILD-INFO.txt
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: buildfre_win10_amd64.log
+          if-no-files-found: ignore
