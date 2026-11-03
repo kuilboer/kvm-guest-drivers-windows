@@ -6,6 +6,10 @@ name: viogpudo PoC (test-signed)
 
 on:
   workflow_dispatch:
+  # workflow_dispatch only works once the file is on the default branch,
+  # so also build on pushes to the PoC branch
+  push:
+    branches: [poc/viogpudo-977]
 
 permissions:
   contents: read
