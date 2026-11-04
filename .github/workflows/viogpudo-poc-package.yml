@@ -54,14 +54,16 @@ jobs:
         run: |
           $inf = "$env:PKG\viogpudo.inf"
           $text = Get-Content $inf -Raw
+          $crlf = ([regex]::Matches($text, "`r`n")).Count
           $edits = @()
           if ($env:INF_HWCURSOR) { $edits += ,@('(?m)^(HKR,, HWCursor,\s+%REG_DWORD%,\s*)\d+', "`${1}$env:INF_HWCURSOR") }
-          if ($env:INF_DRIVERVER) { $edits += ,@('(?m)^DriverVer = .*$', "DriverVer = $env:INF_DRIVERVER") }
+          if ($env:INF_DRIVERVER) { $edits += ,@('(?m)^DriverVer = [^\r\n]*', "DriverVer = $env:INF_DRIVERVER") }
           foreach ($e in $edits) {
             $n = [regex]::Matches($text, $e[0]).Count
             if ($n -ne 1) { throw "INF pattern $($e[0]) matched $n times" }
             $text = [regex]::Replace($text, $e[0], $e[1])
           }
+          if (([regex]::Matches($text, "`r`n")).Count -ne $crlf) { throw 'INF line endings changed' }
           # Keep the INF's original encoding and line endings
           [IO.File]::WriteAllText($inf, $text, [Text.Encoding]::ASCII)
           Select-String -Path $inf -Pattern '^DriverVer', 'HWCursor'
