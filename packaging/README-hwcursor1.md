@@ -72,9 +72,13 @@ No registry step is needed: the INF sets `HWCursor` = 1.
 ## Expected behaviour
 
 - Hover shape changes (I-beam, resize arrows) via the hardware cursor, no echo.
-- While dragging or resizing a window, Windows deliberately switches to a software pointer; over
-  QEMU VNC (noVNC) a second, lagging arrow is visible for the duration of the drag only. This is
-  Windows plus QEMU behaviour, not fixable in this driver (confirmed by WPP trace).
+- While dragging or resizing a window, a second, lagging arrow can be visible over QEMU VNC
+  (noVNC) for the duration of the drag only. This is not a failure criterion for this package.
+  What was measured (one drag, Windows 10, WPP trace plus noVNC pixel check): at the start of the
+  move/size loop Windows hides the hardware cursor (`SetPointerPosition` with `Visible = 0`)
+  without a failing driver call before it, and an arrow is drawn into the framebuffer while noVNC
+  keeps showing its own cursor. Likely, but not verified: QEMU's VNC server does not pass the hide
+  on to the client. Whether the driver could avoid it has not been established.
 
 ## Rollback
 
