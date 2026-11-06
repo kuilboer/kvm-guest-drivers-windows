@@ -1,0 +1,161 @@
+# PoC build of viogpudo from upstream PR #1715 (head 74594634), test-signed and packaged for all
+# x64 Windows 10-based platforms with HWCursor=1 as INF default.
+# Not an upstream workflow: only builds viogpu for Win10 x64 and signs the result with a
+# self-signed test certificate held in repository secrets.
+
+name: viogpudo PoC PR 1715 (test-signed, all x64)
+
+on:
+  workflow_dispatch:
+  # workflow_dispatch only works once the file is on the default branch,
+  # so also build on pushes to the PoC branch
+  push:
+    branches: [poc/viogpudo-1715]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      EXPECTED_HEAD: 74594634ae0ce79a822031d49981e2b1fd82c586
+      INSTALL_DIR: viogpu\Install\Win10\amd64
+      PKG: pkg
+      # Driver version 100.200.1715.<run>: ranks above the 100.200.977.x PoC packages
+      VER_RELEASE: "200"
+      VER_MAJOR: "1715"
+      INF_HWCURSOR: "1"
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Verify the built source is the PR head
+        run: |
+          git log --oneline -6
+          git merge-base --is-ancestor $env:EXPECTED_HEAD HEAD
+          if ($LASTEXITCODE) { throw "$env:EXPECTED_HEAD is not an ancestor of HEAD" }
+          # Everything outside .github and packaging must be byte-identical to the PR head
+          git diff --quiet $env:EXPECTED_HEAD HEAD -- . ':!.github' ':!packaging'
+          if ($LASTEXITCODE) { git diff --stat $env:EXPECTED_HEAD HEAD -- . ':!.github' ':!packaging'; throw "Source differs from $env:EXPECTED_HEAD" }
+          Write-Host "OK: HEAD $(git rev-parse HEAD) contains $env:EXPECTED_HEAD with identical driver source"
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Locate WDK tools
+        run: |
+          $kits = 'C:\Program Files (x86)\Windows Kits\10\bin'
+          $inf2cat = Get-ChildItem $kits -Recurse -Filter inf2cat.exe | Where-Object FullName -match '\\x86\\' | Sort-Object FullName | Select-Object -Last 1
+          $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe | Where-Object FullName -match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1
+          if (-not $inf2cat -or -not $signtool) { throw "WDK tools not found (inf2cat=$inf2cat signtool=$signtool)" }
+          Write-Host "inf2cat:  $($inf2cat.FullName)"
+          Write-Host "signtool: $($signtool.FullName)"
+          $inf2cat.DirectoryName  | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $signtool.DirectoryName | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build viogpu (Win10 Release x64)
+        run: |
+          msbuild viogpu\viogpu.sln -m -t:Build `
+            "-p:Configuration=Win10 Release" -p:Platform=x64 `
+            -p:_RHEL_RELEASE_VERSION_=$env:VER_RELEASE `
+            -p:_BUILD_MAJOR_VERSION_=$env:VER_MAJOR `
+            -p:_BUILD_MINOR_VERSION_=${{ github.run_number }} `
+            "-flp:LogFile=buildfre_win10_amd64.log;Verbosity=normal"
+          if ($LASTEXITCODE) { throw "msbuild failed" }
+          Get-ChildItem $env:INSTALL_DIR
+          New-Item -ItemType Directory $env:PKG | Out-Null
+          Copy-Item "$env:INSTALL_DIR\viogpudo.sys", "$env:INSTALL_DIR\viogpudo.inf", "$env:INSTALL_DIR\viogpudo.pdb" $env:PKG
+
+      - name: Set HWCursor default in INF
+        run: |
+          $inf = "$env:PKG\viogpudo.inf"
+          $text = Get-Content $inf -Raw
+          $crlf = ([regex]::Matches($text, "`r`n")).Count
+          $pattern = '(?m)^(HKR,, HWCursor,\s+%REG_DWORD%,\s*)\d+'
+          $n = [regex]::Matches($text, $pattern).Count
+          if ($n -ne 1) { throw "INF pattern $pattern matched $n times" }
+          $text = [regex]::Replace($text, $pattern, "`${1}$env:INF_HWCURSOR")
+          if (([regex]::Matches($text, "`r`n")).Count -ne $crlf) { throw 'INF line endings changed' }
+          [IO.File]::WriteAllText($inf, $text, [Text.Encoding]::ASCII)
+          $ver = ((Select-String -Path $inf -Pattern '^DriverVer\s*=\s*[^,]*,\s*([\d.]+)').Matches[0].Groups[1].Value)
+          Select-String -Path $inf -Pattern '^DriverVer', 'HWCursor'
+          "DRV_VERSION=$ver" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Choose catalog OS list
+        run: |
+          # Keep only the identifiers this inf2cat actually knows, rather than guessing names
+          $help = (inf2cat /? 2>&1) -join "`n"
+          $wanted = '10_X64','10_AU_X64','10_RS5_X64','10_19H1_X64','10_VB_X64','10_CO_X64','10_NI_X64','10_GE_X64',
+                    'Server10_X64','ServerRS5_X64','ServerFE_X64','ServerGE_X64','Server2025_X64'
+          $os = $wanted | Where-Object { $help -match "(?m)\b$([regex]::Escape($_))\b" }
+          if ($os -notcontains '10_X64' -or $os -notcontains 'ServerFE_X64') { throw "inf2cat OS list unexpected: $($os -join ',')" }
+          Write-Host "Catalog OS list: $($os -join ',')"
+          "CAT_OS=$($os -join ',')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Test-sign driver and catalog
+        env:
+          PFX_B64: ${{ secrets.POC_SIGN_PFX_B64 }}
+          PFX_PASSWORD: ${{ secrets.POC_SIGN_PFX_PASSWORD }}
+        run: |
+          if (-not $env:PFX_B64) { throw "POC_SIGN_PFX_B64 secret is not set" }
+          $pfx = Join-Path $env:RUNNER_TEMP 'poc.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+          $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:PFX_PASSWORD)
+          Write-Host "Signing as: $($cert.Subject)  thumbprint $($cert.Thumbprint)  expires $($cert.NotAfter)"
+          [IO.File]::WriteAllBytes("$env:PKG\ClassroomPocDriver.cer", $cert.Export('Cert'))
+
+          # Sign the .sys first, then build the catalog over it and sign the catalog;
+          # inf2cat must only see the driver files
+          signtool sign /v /fd SHA256 /f $pfx /p $env:PFX_PASSWORD "$env:PKG\viogpudo.sys"
+          if ($LASTEXITCODE) { throw "signing viogpudo.sys failed" }
+          $work = Join-Path $env:RUNNER_TEMP 'drv'
+          New-Item -ItemType Directory $work | Out-Null
+          Copy-Item "$env:PKG\viogpudo.sys", "$env:PKG\viogpudo.inf" $work
+          inf2cat /uselocaltime /driver:$work /os:$env:CAT_OS
+          if ($LASTEXITCODE) { throw "inf2cat failed" }
+          signtool sign /v /fd SHA256 /f $pfx /p $env:PFX_PASSWORD "$work\viogpudo.cat"
+          if ($LASTEXITCODE) { throw "signing viogpudo.cat failed" }
+          Remove-Item $pfx
+          Copy-Item "$work\viogpudo.cat" $env:PKG
+
+          # Verify the chain the way the guest will see it: cert trusted as root
+          Import-Certificate -FilePath "$env:PKG\ClassroomPocDriver.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          signtool verify /v /pa "$env:PKG\viogpudo.sys"
+          if ($LASTEXITCODE) { throw "verify viogpudo.sys failed" }
+          signtool verify /v /pa /c "$env:PKG\viogpudo.cat" "$env:PKG\viogpudo.sys"
+          if ($LASTEXITCODE) { throw "verify catalog membership failed" }
+
+      - name: Finish package
+        run: |
+          (Get-Content packaging\README-1715.md -Raw).Replace('@DRV_VERSION@', $env:DRV_VERSION) |
+            Set-Content -NoNewline -Encoding utf8 "$env:PKG\README.md"
+          @(
+            "commit:   $(git rev-parse HEAD)"
+            "contains: $env:EXPECTED_HEAD (virtio-win/kvm-guest-drivers-windows PR #1715 head)"
+            "run:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            (Select-String -Path "$env:PKG\viogpudo.inf" -Pattern '^DriverVer').Line
+            "inf:      HWCursor default=$env:INF_HWCURSOR (upstream: 0)"
+            "catalog:  $env:CAT_OS"
+          ) | Tee-Object -FilePath "$env:PKG\BUILD-INFO.txt"
+          Get-ChildItem $env:PKG -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Tee-Object -FilePath "$env:PKG\SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viogpudo-${{ env.DRV_VERSION }}-hwcursor1-x64-testsigned
+          path: ${{ env.PKG }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: buildfre_win10_amd64.log
+          if-no-files-found: ignore
